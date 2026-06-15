@@ -1,0 +1,505 @@
+# -*- coding: utf-8 -*-
+"""
+Tkinter GUI - ESP32 Dual Motor Control Monitor + Export Excel
+
+- Parse lines containing: Target:..., M1_Act:..., M2_Act:...
+- Plot Target, M1_Act, M2_Act vs time (realtime)
+- GUI: select COM, baud, connect/disconnect, send commands, tuning Kp_pos/Ki_pos
+- Export collected data to Excel (.xlsx) with path entry + browse button
+"""
+
+import re
+import time
+import threading
+import queue
+from collections import deque
+from datetime import datetime
+import os
+
+import tkinter as tk
+from tkinter import ttk, messagebox, filedialog
+
+import serial
+from serial.tools import list_ports
+
+import matplotlib
+matplotlib.use("TkAgg")
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+
+from openpyxl import Workbook
+from openpyxl.styles import Font, Alignment
+
+# Cập nhật Regex để khớp với chuỗi "Target:90.00 M1_Act:90.00 M2_Act:90.00"
+LINE_RE = re.compile(
+    r"Target:\s*([-+]?\d*\.?\d+)\s+M1_Act:\s*([-+]?\d*\.?\d+)\s+M2_Act:\s*([-+]?\d*\.?\d+)",
+    re.IGNORECASE,
+)
+
+def list_serial_ports():
+    return [p.device for p in list_ports.comports()]
+
+class SerialWorker:
+    def __init__(self):
+        self.ser = None
+        self.thread = None
+        self.stop_event = threading.Event()
+        self.q = queue.Queue(maxsize=5000)
+        self.last_line = ""
+        self.t0 = None
+
+    def is_connected(self) -> bool:
+        return self.ser is not None and self.ser.is_open
+
+    def connect(self, port: str, baud: int) -> None:
+        if self.is_connected():
+            return
+        self.stop_event.clear()
+        self.ser = serial.Serial(port, baudrate=baud, timeout=0.2)
+        self.t0 = time.perf_counter()
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+
+    def disconnect(self) -> None:
+        self.stop_event.set()
+        if self.thread and self.thread.is_alive():
+            self.thread.join(timeout=1.0)
+        try:
+            if self.ser:
+                self.ser.close()
+        except Exception:
+            pass
+        self.ser = None
+        self.thread = None
+
+    def send(self, text: str) -> None:
+        if not self.is_connected():
+            return
+        try:
+            self.ser.write((text.strip() + "\n").encode("utf-8"))
+        except Exception:
+            pass
+
+    def _run(self):
+        while not self.stop_event.is_set():
+            try:
+                raw = self.ser.readline()
+                if not raw:
+                    continue
+
+                line = raw.decode(errors="ignore").strip()
+                if not line:
+                    continue
+
+                self.last_line = line
+
+                m = LINE_RE.search(line)
+                if not m:
+                    continue
+
+                target = float(m.group(1))
+                m1_act = float(m.group(2))
+                m2_act = float(m.group(3))
+                t = time.perf_counter() - self.t0
+
+                try:
+                    self.q.put_nowait((t, target, m1_act, m2_act, line))
+                except queue.Full:
+                    try:
+                        for _ in range(50):
+                            self.q.get_nowait()
+                    except Exception:
+                        pass
+                    try:
+                        self.q.put_nowait((t, target, m1_act, m2_act, line))
+                    except Exception:
+                        pass
+
+            except (serial.SerialException, OSError):
+                break
+            except Exception:
+                continue
+
+class App(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("ESP32 - Dual Motor Position Monitor")
+        self.geometry("1200x780")
+
+        self.worker = SerialWorker()
+
+        # Buffers for plotting
+        self.window_s = tk.DoubleVar(value=15.0)
+        self.maxlen = 12000
+        self.t_buf = deque(maxlen=self.maxlen)
+        self.target_buf = deque(maxlen=self.maxlen)
+        self.m1_buf = deque(maxlen=self.maxlen)
+        self.m2_buf = deque(maxlen=self.maxlen)
+
+        # Full dataset for Excel export
+        self.data_all = []  
+
+        self.save_path_var = tk.StringVar(value=self._default_save_path())
+
+        self._build_controls()
+        self._build_plot()
+        self._build_log()
+
+        self._refresh_ports()
+
+        self.after(50, self._poll_serial_and_update_plot)
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+    def _default_save_path(self) -> str:
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        return os.path.join(os.getcwd(), f"esp32_dual_log_{stamp}.xlsx")
+
+    def _build_controls(self):
+        # ROW 1: Connection
+        frm = ttk.Frame(self, padding=10)
+        frm.pack(side=tk.TOP, fill=tk.X)
+
+        ttk.Label(frm, text="COM:").grid(row=0, column=0, sticky="w")
+        self.cmb_port = ttk.Combobox(frm, width=18, state="readonly")
+        self.cmb_port.grid(row=0, column=1, padx=5)
+
+        ttk.Button(frm, text="Refresh", command=self._refresh_ports).grid(row=0, column=2, padx=5)
+
+        ttk.Label(frm, text="Baud:").grid(row=0, column=3, sticky="w", padx=(15, 0))
+        self.ent_baud = ttk.Entry(frm, width=10)
+        self.ent_baud.insert(0, "115200")
+        self.ent_baud.grid(row=0, column=4, padx=5)
+
+        ttk.Label(frm, text="Window(s):").grid(row=0, column=5, sticky="w", padx=(15, 0))
+        self.ent_window = ttk.Entry(frm, width=8, textvariable=self.window_s)
+        self.ent_window.grid(row=0, column=6, padx=5)
+
+        self.btn_connect = ttk.Button(frm, text="Connect", command=self._toggle_connect)
+        self.btn_connect.grid(row=0, column=7, padx=(15, 5))
+
+        self.lbl_status = ttk.Label(frm, text="Status: Disconnected")
+        self.lbl_status.grid(row=0, column=8, sticky="w", padx=(10, 0))
+
+        # ROW 2: Commands
+        frm2 = ttk.Frame(self, padding=(10, 0, 10, 8))
+        frm2.pack(side=tk.TOP, fill=tk.X)
+
+        ttk.Label(frm2, text="Command:").grid(row=0, column=0, sticky="w")
+        self.ent_cmd = ttk.Entry(frm2, width=30)
+        self.ent_cmd.insert(0, "p=90") 
+        self.ent_cmd.grid(row=0, column=1, padx=5, sticky="w")
+        self.ent_cmd.bind("<Return>", lambda _e: self._send_cmd())
+
+        ttk.Button(frm2, text="Send", command=self._send_cmd).grid(row=0, column=2, padx=5)
+        ttk.Button(frm2, text="Stop", command=lambda: self._send_text("stop")).grid(row=0, column=3, padx=5)
+        ttk.Button(frm2, text="Clear Plot", command=self._clear_plot_only).grid(row=0, column=4, padx=(15, 5))
+        ttk.Button(frm2, text="Clear Data", command=self._clear_all_data).grid(row=0, column=5, padx=5)
+
+        # Labels hiển thị thông số 2 động cơ
+        self.lbl_target = ttk.Label(frm2, text="Target: --")
+        self.lbl_target.grid(row=0, column=6, padx=(20, 5), sticky="w")
+        self.lbl_m1 = ttk.Label(frm2, text="M1: --")
+        self.lbl_m1.grid(row=0, column=7, padx=5, sticky="w")
+        self.lbl_m2 = ttk.Label(frm2, text="M2: --")
+        self.lbl_m2.grid(row=0, column=8, padx=5, sticky="w")
+
+        frm2.columnconfigure(1, weight=1)
+
+        # ROW 3: Kp_pos Ki_pos Tuning
+        frm_tune = ttk.Frame(self, padding=(10, 0, 10, 8))
+        frm_tune.pack(side=tk.TOP, fill=tk.X)
+
+        ttk.Label(frm_tune, text="Kp_pos:").grid(row=0, column=0, sticky="w")
+        self.ent_kp = ttk.Entry(frm_tune, width=15)
+        self.ent_kp.insert(0, "1.5")
+        self.ent_kp.grid(row=0, column=1, padx=5, sticky="w")
+
+        ttk.Label(frm_tune, text="Ki_pos:").grid(row=0, column=2, sticky="w", padx=(15,0))
+        self.ent_ki = ttk.Entry(frm_tune, width=15)
+        self.ent_ki.insert(0, "0.05")
+        self.ent_ki.grid(row=0, column=3, padx=5, sticky="w")
+
+        ttk.Button(frm_tune, text="Update Kp & Ki Pos", command=self._send_kp_ki).grid(row=0, column=4, padx=(15,5))
+
+        # ROW 4: Excel
+        frm3 = ttk.Frame(self, padding=(10, 0, 10, 10))
+        frm3.pack(side=tk.TOP, fill=tk.X)
+
+        ttk.Label(frm3, text="Save path:").grid(row=0, column=0, sticky="w")
+        self.ent_save = ttk.Entry(frm3, textvariable=self.save_path_var)
+        self.ent_save.grid(row=0, column=1, padx=5, sticky="we")
+
+        ttk.Button(frm3, text="Browse", command=self._browse_save_path).grid(row=0, column=2, padx=5)
+        ttk.Button(frm3, text="Save Excel", command=self._save_excel).grid(row=0, column=3, padx=5)
+
+        self.lbl_save_status = ttk.Label(frm3, text="")
+        self.lbl_save_status.grid(row=0, column=4, padx=(10, 0), sticky="w")
+
+        frm3.columnconfigure(1, weight=1)
+
+    def _build_plot(self):
+        plot_frame = ttk.Frame(self, padding=(10, 0, 10, 10))
+        plot_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        self.fig = plt.Figure(figsize=(7.8, 5.8), dpi=100)
+        self.ax = self.fig.add_subplot(111)
+        self.ax.set_title("Dual Motor Control Response")
+        self.ax.set_xlabel("Time (s)")
+        self.ax.set_ylabel("Angle (deg)")
+        self.ax.grid(True)
+
+        # Khởi tạo 3 đường đồ thị
+        (self.line_target,) = self.ax.plot([], [], 'k--', label="Target Angle")
+        (self.line_m1,) = self.ax.plot([], [], 'b-', label="M1 Actual")
+        (self.line_m2,) = self.ax.plot([], [], 'r-', label="M2 Actual")
+        self.ax.legend(loc="upper left")
+
+        self.canvas = FigureCanvasTkAgg(self.fig, master=plot_frame)
+        self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+
+    def _build_log(self):
+        right = ttk.Frame(self, padding=(0, 0, 10, 10))
+        right.pack(side=tk.RIGHT, fill=tk.Y)
+
+        ttk.Label(right, text="Serial Log").pack(anchor="w")
+
+        self.txt_log = tk.Text(right, width=48, height=36, wrap="none")
+        self.txt_log.pack(fill=tk.Y, expand=True)
+        self.txt_log.configure(state=tk.DISABLED)
+
+        btns = ttk.Frame(right)
+        btns.pack(fill=tk.X, pady=(5, 0))
+        ttk.Button(btns, text="Clear Log", command=self._clear_log).pack(side=tk.LEFT)
+
+    def _refresh_ports(self):
+        ports = list_serial_ports()
+        self.cmb_port["values"] = ports
+        if ports and not self.cmb_port.get():
+            self.cmb_port.set(ports[0])
+        if not ports:
+            self.cmb_port.set("")
+
+    def _toggle_connect(self):
+        if self.worker.is_connected():
+            self.worker.disconnect()
+            self.btn_connect.configure(text="Connect")
+            self.lbl_status.configure(text="Status: Disconnected")
+            return
+
+        port = self.cmb_port.get().strip()
+        if not port:
+            messagebox.showerror("Error", "Chưa chọn COM.")
+            return
+
+        try:
+            baud = int(self.ent_baud.get().strip())
+        except Exception:
+            messagebox.showerror("Error", "Baud không hợp lệ.")
+            return
+
+        try:
+            self.worker.connect(port, baud)
+        except Exception as e:
+            messagebox.showerror("Error", f"Không mở được {port}:\n{e}")
+            return
+
+        self.btn_connect.configure(text="Disconnect")
+        self.lbl_status.configure(text=f"Status: Connected to {port} @ {baud}")
+
+    def _send_text(self, text: str):
+        if not self.worker.is_connected():
+            messagebox.showwarning("Warning", "Chưa kết nối COM.")
+            return
+        self.worker.send(text)
+
+    def _send_cmd(self):
+        cmd = self.ent_cmd.get().strip()
+        if cmd:
+            self._send_text(cmd)
+            
+    def _send_kp_ki(self):
+        kp_val = self.ent_kp.get().strip()
+        ki_val = self.ent_ki.get().strip()
+        # Đổi cấu trúc lệnh thành kp_pos=...,ki_pos=...
+        cmd_str = f"kp_pos={kp_val},ki_pos={ki_val}"
+        self._send_text(cmd_str)
+        self._append_log(f">>> Sent Variables: {cmd_str}")
+
+    def _append_log(self, line: str):
+        self.txt_log.configure(state=tk.NORMAL)
+        self.txt_log.insert(tk.END, line + "\n")
+        lines = int(self.txt_log.index("end-1c").split(".")[0])
+        if lines > 400:
+            self.txt_log.delete("1.0", f"{lines-400}.0")
+        self.txt_log.see(tk.END)
+        self.txt_log.configure(state=tk.DISABLED)
+
+    def _clear_log(self):
+        self.txt_log.configure(state=tk.NORMAL)
+        self.txt_log.delete("1.0", tk.END)
+        self.txt_log.configure(state=tk.DISABLED)
+
+    def _clear_plot_only(self):
+        self.t_buf.clear()
+        self.target_buf.clear()
+        self.m1_buf.clear()
+        self.m2_buf.clear()
+        self.line_target.set_data([], [])
+        self.line_m1.set_data([], [])
+        self.line_m2.set_data([], [])
+        self.ax.relim()
+        self.ax.autoscale_view()
+        self.canvas.draw_idle()
+
+    def _clear_all_data(self):
+        if messagebox.askyesno("Confirm", "Xóa toàn bộ dữ liệu đã thu (bao gồm dữ liệu Excel)?"):
+            self.data_all.clear()
+            self._clear_plot_only()
+            self.lbl_save_status.configure(text="Data cleared")
+
+    def _browse_save_path(self):
+        path = filedialog.asksaveasfilename(
+            title="Choose Excel file",
+            defaultextension=".xlsx",
+            filetypes=[("Excel Workbook", "*.xlsx")],
+            initialfile=os.path.basename(self.save_path_var.get()) or "esp32_dual_log.xlsx",
+        )
+        if path:
+            self.save_path_var.set(path)
+
+    def _save_excel(self):
+        if not self.data_all:
+            messagebox.showwarning("Warning", "Chưa có dữ liệu để lưu.")
+            return
+
+        path = self.save_path_var.get().strip()
+        if not path:
+            messagebox.showerror("Error", "Save path đang trống.")
+            return
+
+        if not path.lower().endswith(".xlsx"):
+            path = path + ".xlsx"
+            self.save_path_var.set(path)
+
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Dual Motor Log"
+
+        headers = ["Time (s)", "Target (deg)", "M1 Actual (deg)", "M2 Actual (deg)", "Raw Serial Line"]
+        header_font = Font(bold=True)
+        for c, h in enumerate(headers, start=1):
+            cell = ws.cell(row=1, column=c, value=h)
+            cell.font = header_font
+            cell.alignment = Alignment(horizontal="center")
+
+        for r, (t_s, target, m1_act, m2_act, raw) in enumerate(self.data_all, start=2):
+            ws.cell(row=r, column=1, value=float(t_s))
+            ws.cell(row=r, column=2, value=float(target))
+            ws.cell(row=r, column=3, value=float(m1_act))
+            ws.cell(row=r, column=4, value=float(m2_act))
+            ws.cell(row=r, column=5, value=str(raw))
+
+        ws.column_dimensions["A"].width = 12
+        ws.column_dimensions["B"].width = 15
+        ws.column_dimensions["C"].width = 15
+        ws.column_dimensions["D"].width = 15
+        ws.column_dimensions["E"].width = 70
+
+        meta = wb.create_sheet("Meta")
+        meta["A1"] = "export_time"
+        meta["B1"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        meta["A2"] = "port"
+        meta["B2"] = self.cmb_port.get().strip()
+        meta["A3"] = "samples"
+        meta["B3"] = len(self.data_all)
+
+        try:
+            wb.save(path)
+        except PermissionError:
+            messagebox.showerror("Error", "Không lưu được vì file đang mở trong Excel. Hãy đóng file rồi lưu lại.")
+            return
+        except Exception as e:
+            messagebox.showerror("Error", f"Lưu Excel thất bại:\n{e}")
+            return
+
+        self.lbl_save_status.configure(text=f"Saved: {os.path.basename(path)}")
+
+    def _poll_serial_and_update_plot(self):
+        got_any = False
+        last_target = None
+        last_m1 = None
+        last_m2 = None
+        last_line = None
+
+        while True:
+            try:
+                t, target, m1, m2, line = self.worker.q.get_nowait()
+                got_any = True
+
+                self.data_all.append((t, target, m1, m2, line))
+
+                self.t_buf.append(t)
+                self.target_buf.append(target)
+                self.m1_buf.append(m1)
+                self.m2_buf.append(m2)
+
+                last_target = target
+                last_m1 = m1
+                last_m2 = m2
+                last_line = line
+            except queue.Empty:
+                break
+
+        if got_any:
+            if last_target is not None:
+                self.lbl_target.configure(text=f"Target: {last_target:.1f}°")
+            if last_m1 is not None:
+                self.lbl_m1.configure(text=f"M1: {last_m1:.1f}°")
+            if last_m2 is not None:
+                self.lbl_m2.configure(text=f"M2: {last_m2:.1f}°")
+            if last_line:
+                self._append_log(last_line)
+
+            try:
+                window_s = float(self.window_s.get())
+                if window_s <= 0: window_s = 15.0
+            except Exception:
+                window_s = 15.0
+
+            t_list = list(self.t_buf)
+            
+            if len(t_list) >= 2:
+                t_max = t_list[-1]
+                t_min = max(0.0, t_max - window_s)
+
+                i0 = 0
+                for i in range(len(t_list) - 1, -1, -1):
+                    if t_list[i] < t_min:
+                        i0 = i
+                        break
+
+                tv = t_list[i0:]
+                self.line_target.set_data(tv, list(self.target_buf)[i0:])
+                self.line_m1.set_data(tv, list(self.m1_buf)[i0:])
+                self.line_m2.set_data(tv, list(self.m2_buf)[i0:])
+
+                self.ax.set_xlim(t_min, t_max if t_max > t_min else (t_min + 1.0))
+                self.ax.set_ylim(0, 360) # Cố định thang Y theo góc độ
+                self.canvas.draw_idle()
+
+        if not self.worker.is_connected():
+            if self.btn_connect.cget("text") != "Connect":
+                self.btn_connect.configure(text="Connect")
+                self.lbl_status.configure(text="Status: Disconnected")
+
+        self.after(50, self._poll_serial_and_update_plot)
+
+    def _on_close(self):
+        try:
+            self.worker.disconnect()
+        finally:
+            self.destroy()
+
+if __name__ == "__main__":
+    app = App()
+    app.mainloop()
