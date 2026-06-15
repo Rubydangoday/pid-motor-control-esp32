@@ -1,0 +1,168 @@
+#include <Arduino.h>
+
+// --- CẤU HÌNH PHẦN CỨNG ---
+const uint8_t R_PWM = 17;
+const uint8_t L_PWM = 16;
+const uint8_t phase_a_pen = 33;
+const uint8_t phase_b_pen = 32;
+
+// --- CẤU HÌNH LẤY MẪU & PID ---
+const int PID_INTERVAL = 20; 
+
+
+float Kp_vel = 0.0012;    
+float Ki_vel = 0.35;  
+float Kd_vel = 0.0;    
+
+// --- BIẾN TOÀN CỤC ---
+volatile long pulse_pen = 0;
+unsigned long last_pid_time = 0;
+
+// Biến điều khiển
+long target_velocity = 0;    // Vận tốc mong muốn (Set Point)
+float raw_velocity = 0;      // Vận tốc đo được thô
+float filtered_velocity = 0; // Vận tốc sau lọc LPF
+float velocity_integral = 0; // Tích phân 
+float last_error = 0;        
+long last_pos = 0;          
+
+// Ngắt Encoder
+void IRAM_ATTR encoderISR_pen() {
+  if (digitalRead(phase_a_pen) == digitalRead(phase_b_pen)) 
+    pulse_pen--;
+  else 
+    pulse_pen++;
+}
+
+// Hàm xuất PWM động cơ
+void controlMotor(int pwm_val) {
+  if (pwm_val > 255) pwm_val = 255;
+  if (pwm_val < -255) pwm_val = -255;
+
+  if (pwm_val > 0) {
+    ledcWrite(R_PWM, pwm_val);
+    ledcWrite(L_PWM, 0);
+  } else if (pwm_val < 0) {
+    ledcWrite(R_PWM, 0);
+    ledcWrite(L_PWM, abs(pwm_val));
+  } else {
+    ledcWrite(R_PWM, 0);
+    ledcWrite(L_PWM, 0);
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  
+  pinMode(R_PWM, OUTPUT);
+  pinMode(L_PWM, OUTPUT);
+  pinMode(phase_a_pen, INPUT_PULLUP);
+  pinMode(phase_b_pen, INPUT_PULLUP);
+
+  attachInterrupt(digitalPinToInterrupt(phase_a_pen), encoderISR_pen, CHANGE);
+
+  ledcAttach(R_PWM, 5000, 8); 
+  ledcAttach(L_PWM, 5000, 8);
+
+  controlMotor(0);
+  Serial.println("PID READY. Nhap 'v=1000' de chay. 'v=0' de dung.");
+}
+
+void loop() {
+  if (Serial.available() > 0) {
+  String input = Serial.readStringUntil('\n');
+  input.trim();
+  
+  int startIdx = 0;
+  int commaIdx = input.indexOf(',');
+  
+  while (startIdx < input.length()) {
+    String part;
+    if (commaIdx == -1) {
+      part = input.substring(startIdx);
+      startIdx = input.length();
+    } else {
+      part = input.substring(startIdx, commaIdx);
+      startIdx = commaIdx + 1;
+      commaIdx = input.indexOf(',', startIdx);
+    }
+    
+    part.trim();
+    
+    if (part.startsWith("v=")) {
+      target_velocity = part.substring(2).toInt();
+      if (target_velocity == 0) {
+        velocity_integral = 0;
+        filtered_velocity = 0;
+        controlMotor(0);
+      }
+    } 
+    else if (part.startsWith("kp=")) {
+      Kp_vel = part.substring(3).toFloat();
+    } 
+    else if (part.startsWith("ki=")) {
+      Ki_vel = part.substring(3).toFloat();
+    }
+  }
+}
+
+
+  // --- 2. PID ---
+  unsigned long now = millis();
+  if (now - last_pid_time >= PID_INTERVAL) {
+    
+    // A. Tính vận tốc & Lọc nhiễu
+    long current_pos = pulse_pen;
+    long delta_pos = current_pos - last_pos;
+    last_pos = current_pos;
+
+    // Vận tốc (xung/giây)
+    raw_velocity = delta_pos * (1000.0 / PID_INTERVAL); 
+    
+    filtered_velocity = (0.7 * filtered_velocity) + (0.3 * raw_velocity);
+
+    // B. Tính toán PID
+    float error = target_velocity - filtered_velocity;
+    float dt = PID_INTERVAL / 1000.0;
+    float K_ff = 0.01159;
+    float FF = target_velocity * K_ff;
+    
+    // Khâu P
+    float P = Kp_vel * error;
+
+    // Khâu I 
+    velocity_integral += error * dt;
+    float I = 0;
+
+    if (Ki_vel != 0) {
+      I = Ki_vel * velocity_integral;
+      if (I > 255.0) { 
+        I = 255.0; 
+        velocity_integral = 255.0 / Ki_vel; 
+      } else if (I < -255.0) { 
+        I = -255.0; 
+        velocity_integral = -255.0 / Ki_vel; 
+      }
+    } else {
+      velocity_integral = 0; 
+    }
+
+    // Khâu D 
+    float D = Kd_vel * (error - last_error) / dt;
+    last_error = error;
+
+    // ngõ ra
+    float output = FF + P + I + D;
+
+    controlMotor((int)output);
+
+    Serial.print("rpm=");
+    Serial.print(filtered_velocity);
+    Serial.print(" set_rpm=");
+    Serial.print(target_velocity);
+    Serial.print(" pwm=");
+    Serial.println(output);
+
+    last_pid_time = now;
+  }
+}
