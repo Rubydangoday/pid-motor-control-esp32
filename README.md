@@ -45,5 +45,5 @@ Outer loop: position control | Inner loop: velocity control.
 
 ## Results
 
-- Stable position tracking with overshoot < [X]%
-- Steady-state error < [X] counts
+- Stable position tracking with overshoot 
+- Steady-state error 
